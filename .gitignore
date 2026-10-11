@@ -1,0 +1,19 @@
+# IDE / Python
+.idea/
+.venv/
+__pycache__/
+*.pyc
+
+# Go build artifacts
+core/bin/
+
+# Секреты: конфиги с реальными ключами никогда не коммитим
+deploy/server.json
+deploy/vpn-server-linux
+test/server-generated.json
+test/server-reality.json
+test/xray-client-reality.json
+
+# Логи и временные файлы
+*.log
+.DS_Store

@@ -1,0 +1,12 @@
+services:
+  vpn-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vpn-server:local
+    container_name: vpn-server
+    ports:
+      - "443:443"
+    volumes:
+      - ./server.json:/etc/vpn/server.json:ro
+    restart: unless-stopped

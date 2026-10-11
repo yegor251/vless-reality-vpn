@@ -1,0 +1,30 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "socks",
+      "port": 1080,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": { "udp": false }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 8388,
+            "users": [
+              { "id": "5bab9cc8-b064-4b53-81c8-117be55d2238", "encryption": "none" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": { "network": "tcp", "security": "none" }
+    }
+  ]
+}
