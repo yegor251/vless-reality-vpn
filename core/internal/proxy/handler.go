@@ -49,12 +49,18 @@ func Handle(conn net.Conn, users *auth.Store, rcfg *reality.Config) {
 	}
 	defer target.Close()
 
+	// the response goes out raw, before any vision framing starts
 	if err := vless.WriteResponse(conn); err != nil {
 		log.Printf("%s: write response: %v", conn.RemoteAddr(), err)
 		return
 	}
 	log.Printf("%s -> %s:%d", conn.RemoteAddr(), req.Host, req.Port)
 
+	if vless.ParseFlow(req.Addons) == vless.XRV {
+		vc := vless.NewVisionConn(conn, r, req.UserID)
+		relay(target, vc, vc)
+		return
+	}
 	relay(target, conn, r)
 }
 

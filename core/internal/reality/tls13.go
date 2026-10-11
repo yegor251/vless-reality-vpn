@@ -530,6 +530,19 @@ func (c *tls13Conn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
+// Underlying exposes the raw transport for xtls vision direct copy,
+// where the write side drops the outer TLS record layer.
+func (c *tls13Conn) Underlying() net.Conn { return c.Conn }
+
+// VisionDirect is the read-side counterpart of Underlying: it returns the
+// raw transport plus every stream byte still buffered inside this conn
+// (decrypted payload first, then bytes read past the current record).
+func (c *tls13Conn) VisionDirect() (net.Conn, []byte) {
+	buffered := append(c.plain, c.pending...)
+	c.plain, c.pending = nil, nil
+	return c.Conn, buffered
+}
+
 func (c *tls13Conn) Close() error {
 	if c.writeAEAD != nil {
 		c.writeRecord(recordTypeAlert, []byte{1, 0}) // close_notify, best effort

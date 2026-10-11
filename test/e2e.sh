@@ -33,7 +33,10 @@ server = {
 }
 json.dump(server, open("server-reality.json", "w"), indent=2)
 
-def client_config(socks_port, short_id):
+def client_config(socks_port, short_id, flow=""):
+    user = {"id": uuid, "encryption": "none"}
+    if flow:
+        user["flow"] = flow
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [{
@@ -44,7 +47,7 @@ def client_config(socks_port, short_id):
             "tag": "proxy", "protocol": "vless",
             "settings": {"vnext": [{
                 "address": "127.0.0.1", "port": 8443,
-                "users": [{"id": uuid, "encryption": "none"}],
+                "users": [user],
             }]},
             "streamSettings": {
                 "network": "tcp", "security": "reality",
@@ -58,10 +61,11 @@ def client_config(socks_port, short_id):
 
 json.dump(client_config(1081, sid), open("xray-client-reality.json", "w"), indent=2)
 json.dump(client_config(1082, "ffffffffffffffff"), open("/tmp/xray-bad-sid.json", "w"))
+json.dump(client_config(1085, sid, "xtls-rprx-vision"), open("/tmp/xray-vision.json", "w"))
 EOF
 
 cleanup() {
-    for pid in "$HTTP_PID" "$PLAIN_PID" "$REALITY_PID" "$XRAY_PID" "$XRAY_BAD_PID" "$GEN_PID" "$XRAY3_PID"; do
+    for pid in "$HTTP_PID" "$PLAIN_PID" "$REALITY_PID" "$XRAY_PID" "$XRAY_BAD_PID" "${GEN_PID:-}" "${XRAY3_PID:-}" "${XRAY4_PID:-}"; do
         [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
     done
 }
@@ -79,6 +83,8 @@ XRAY_PID=$!
 XRAY2_PID=$!
 "$XRAY" run -c /tmp/xray-bad-sid.json >/dev/null 2>&1 &
 XRAY_BAD_PID=$!
+"$XRAY" run -c /tmp/xray-vision.json >/dev/null 2>&1 &
+XRAY4_PID=$!
 sleep 1.5
 
 fail=0
@@ -107,6 +113,13 @@ check "M2 reality: prober sees real dest certificate" $?
 
 code=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:1082 http://127.0.0.1:8099/hello.txt -o /dev/null -w "%{http_code}" || true)
 [ "$code" = "000" ]; check "M2 reality: wrong short id rejected" $?
+
+# --- M5: xtls-rprx-vision flow -------------------------------------------------
+body=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:1085 http://localhost:8099/hello.txt)
+[ "$body" = "hello through vless" ]; check "M5 vision: plain http (early end)" $?
+
+code=$(curl -s --max-time 30 --socks5-hostname 127.0.0.1:1085 https://www.apple.com/ -o /dev/null -w "%{http_code}" || true)
+[ "$code" = "200" ]; check "M5 vision: inner TLS 1.3 (direct copy)" $?
 
 # --- M4: full cycle through vpnctl and a vless:// link -----------------------
 rm -f server-generated.json
