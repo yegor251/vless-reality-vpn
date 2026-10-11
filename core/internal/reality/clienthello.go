@@ -16,6 +16,7 @@ const (
 	groupX25519MLKEM768 uint16 = 0x11ec // IANA: 4588
 
 	mlkem768EncapsulationKeySize = 1184
+	mlkem768CiphertextSize       = 1088
 	maxRecordSize                = 16384 + 1024
 )
 

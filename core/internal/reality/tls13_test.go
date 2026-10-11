@@ -48,7 +48,7 @@ func TestTLS13HandshakeWithStdlibClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	certDER, certPriv := buildCert(bytes.Repeat([]byte{3}, 32))
-	conn, err := serverHandshake(server, ch, certDER, certPriv)
+	conn, err := serverHandshake(server, ch, certDER, certPriv, nil)
 	if err != nil {
 		server.Close()
 		select {

@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log"
 	"net"
+	"os"
 )
 
 const (
@@ -38,6 +40,10 @@ const (
 	handshakeTypeKeyUpdate       = 24
 
 	ed25519SigAlg = 0x0807
+
+	// recordTypeRawStream is an internal sentinel: the record layer handed
+	// over to raw stream mode (vision direct copy).
+	recordTypeRawStream = 0xff
 )
 
 type suiteInfo struct {
@@ -171,7 +177,17 @@ type tls13Conn struct {
 
 	pending []byte // bytes read off the wire but not yet parsed into records
 	plain   []byte // decrypted application data not yet returned by Read
+
+	rawFallback bool // armed by the vision layer once the peer went direct
+	rawMode     bool // set on the first decrypt failure afterwards: the peer
+	// dropped the outer record layer, everything from now on — pending bytes,
+	// socket reads — is raw stream content
 }
+
+// SetRawFallback arms the raw-stream handover: the next record that fails to
+// decrypt starts the raw mode, where the conn serves the peer's unframed
+// bytes (xtls vision direct copy). See VisionConn.
+func (c *tls13Conn) SetRawFallback() { c.rawFallback = true }
 
 func (c *tls13Conn) setReadKeys(secret []byte) error {
 	aead, iv, err := trafficKeys(c.suite, secret)
@@ -220,20 +236,24 @@ func (c *tls13Conn) readN(n int) ([]byte, error) {
 	return b, nil
 }
 
-func (c *tls13Conn) readPhysicalRecord() (byte, []byte, error) {
+func (c *tls13Conn) readPhysicalRecord() (byte, []byte, []byte, error) {
 	head, err := c.readN(5)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	length := int(head[3])<<8 | int(head[4])
 	if length == 0 || length > 1<<14+256 {
-		return 0, nil, fmt.Errorf("bad record length %d", length)
+		return 0, nil, head, fmt.Errorf("bad record length %d", length)
 	}
 	body, err := c.readN(length)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, head, err
 	}
-	return head[0], body, nil
+	if tlsDebug {
+		log.Printf("tls read: record type=%d len=%d readSeq=%d plain=%d pending=%d",
+			head[0], length, c.readSeq, len(c.plain), len(c.pending))
+	}
+	return head[0], body, head, nil
 }
 
 func (c *tls13Conn) decrypt(body []byte, recordType byte) ([]byte, error) {
@@ -247,9 +267,11 @@ func (c *tls13Conn) decrypt(body []byte, recordType byte) ([]byte, error) {
 }
 
 // readRecord returns the inner content type and plaintext of the next record.
+var tlsDebug = os.Getenv("VPN_TLS_DEBUG") != ""
+
 func (c *tls13Conn) readRecord() (byte, []byte, error) {
 	for {
-		typ, body, err := c.readPhysicalRecord()
+		typ, body, head, err := c.readPhysicalRecord()
 		if err != nil {
 			return 0, nil, err
 		}
@@ -267,6 +289,18 @@ func (c *tls13Conn) readRecord() (byte, []byte, error) {
 			}
 			plain, err := c.decrypt(body, typ)
 			if err != nil {
+				if c.rawFallback && !c.rawMode {
+					// the peer dropped the outer record layer (vision direct
+					// copy): this "record" is raw stream content, and so is
+					// everything after it
+					c.rawMode = true
+					c.plain = append(append([]byte{}, head...), body...)
+					return recordTypeRawStream, nil, nil
+				}
+				if tlsDebug {
+					log.Printf("tls read: decrypt failed, record head=% x body[:8]=% x seq=%d",
+						head, body[:min(8, len(body))], c.readSeq)
+				}
 				return 0, nil, err
 			}
 			if len(plain) == 0 {
@@ -290,6 +324,27 @@ func (c *tls13Conn) writePlainRecord(recordType byte, payload []byte) error {
 
 func (c *tls13Conn) writeRecord(innerType byte, payload []byte) error {
 	inner := append(append([]byte{}, payload...), innerType)
+	return c.writeSealedRecord(inner)
+}
+
+// writeRecordPad seals payload plus the content type byte plus zero padding,
+// sizing the whole record to target bytes (RFC 8446 trailing padding), the
+// way the reference mimics dest record lengths.
+func (c *tls13Conn) writeRecordPad(innerType byte, payload []byte, target int) error {
+	plainLen := target - 5 - c.writeAEAD.Overhead()
+	if plainLen < len(payload)+1 {
+		return fmt.Errorf("pad target %d too small for %d-byte payload", target, len(payload))
+	}
+	inner := make([]byte, 0, plainLen)
+	inner = append(inner, payload...)
+	inner = append(inner, innerType)
+	inner = append(inner, make([]byte, plainLen-len(inner))...)
+	return c.writeSealedRecord(inner)
+}
+
+// writeSealedRecord encrypts an already-shaped plaintext (content, type
+// byte, trailing padding) as one application-data record.
+func (c *tls13Conn) writeSealedRecord(inner []byte) error {
 	header := []byte{recordTypeApplicationData, 0x03, 0x03,
 		byte((len(inner) + c.writeAEAD.Overhead()) >> 8), byte(len(inner) + c.writeAEAD.Overhead())}
 	cipherText := c.writeAEAD.Seal(nil, c.nonce(c.writeIV, c.writeSeq), inner, header)
@@ -298,45 +353,93 @@ func (c *tls13Conn) writeRecord(innerType byte, payload []byte) error {
 	return err
 }
 
+// writeFakeRecord emits a junk-but-right-length encrypted record that
+// mimics one of dest's post-handshake records (e.g. NewSessionTicket).
+func (c *tls13Conn) writeFakeRecord(total int) error {
+	if total <= 5+c.writeAEAD.Overhead()+6 {
+		return nil
+	}
+	plain := make([]byte, total-5-c.writeAEAD.Overhead())
+	copy(plain, []byte{0x17, 0x03, 0x03, byte((total - 5) >> 8), byte(total - 5), 0x17})
+	return c.writeSealedRecord(plain)
+}
+
 // serverHandshake drives the TLS 1.3 server side. ch must be the parse of
 // the ClientHello received on conn (raw bytes already consumed from it).
-func serverHandshake(conn net.Conn, ch *ClientHello, certDER []byte, certPriv ed25519.PrivateKey) (*tls13Conn, error) {
-	suite, err := pickSuite(ch.CipherSuites)
-	if err != nil {
-		return nil, err
+// A non-nil flight mirrors dest: its ServerHello record is echoed with our
+// key share patched in and the encrypted flight is padded to dest's record
+// lengths, followed by junk records matching dest's post-handshake ones.
+func serverHandshake(conn net.Conn, ch *ClientHello, certDER []byte, certPriv ed25519.PrivateKey, flight *destFlight) (*tls13Conn, error) {
+	var (
+		suite        suiteInfo
+		serverShare  []byte
+		sharedSecret []byte
+		err          error
+	)
+	if flight != nil {
+		suite, err = suiteByID(flight.suiteID)
+		if err != nil {
+			return nil, err
+		}
+		serverShare, sharedSecret, err = negotiateForGroup(ch.KeyShares, flight.group)
+		if err != nil {
+			return nil, err
+		}
+		if len(serverShare) != flight.shareLen {
+			return nil, fmt.Errorf("share length %d != dest share %d", len(serverShare), flight.shareLen)
+		}
+		copy(flight.serverHello[flight.shareOff:flight.shareOff+flight.shareLen], serverShare)
+	} else {
+		suite, err = pickSuite(ch.CipherSuites)
+		if err != nil {
+			return nil, err
+		}
+		var group uint16
+		group, serverShare, sharedSecret, err = negotiateKeyShare(ch.KeyShares)
+		if err != nil {
+			return nil, err
+		}
+		flight = &destFlight{}
+
+		serverRandom := make([]byte, 32)
+		rand.Read(serverRandom)
+
+		var shExts []byte
+		shExts = append(shExts, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04) // supported_versions
+		ksLen := len(serverShare) + 4
+		shExts = append(shExts, 0x00, 0x33, byte(ksLen>>8), byte(ksLen),
+			byte(group>>8), byte(group), byte(len(serverShare)>>8), byte(len(serverShare)))
+		shExts = append(shExts, serverShare...)
+
+		shBody := []byte{0x03, 0x03}
+		shBody = append(shBody, serverRandom...)
+		shBody = append(shBody, byte(len(ch.SessionID)))
+		shBody = append(shBody, ch.SessionID...)
+		shBody = append(shBody, byte(suite.id>>8), byte(suite.id), 0x00)
+		shBody = append(shBody, byte(len(shExts)>>8), byte(len(shExts)))
+		shBody = append(shBody, shExts...)
+		flight.serverHello = handshakeMsg(handshakeTypeServerHello, shBody)
 	}
-	group, serverShare, sharedSecret, err := negotiateKeyShare(ch.KeyShares)
-	if err != nil {
-		return nil, err
-	}
-
-	serverRandom := make([]byte, 32)
-	rand.Read(serverRandom)
-
-	var shExts []byte
-	shExts = append(shExts, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04) // supported_versions
-	ksLen := len(serverShare) + 4
-	shExts = append(shExts, 0x00, 0x33, byte(ksLen>>8), byte(ksLen),
-		byte(group>>8), byte(group), byte(len(serverShare)>>8), byte(len(serverShare)))
-	shExts = append(shExts, serverShare...)
-
-	shBody := []byte{0x03, 0x03}
-	shBody = append(shBody, serverRandom...)
-	shBody = append(shBody, byte(len(ch.SessionID)))
-	shBody = append(shBody, ch.SessionID...)
-	shBody = append(shBody, byte(suite.id>>8), byte(suite.id), 0x00)
-	shBody = append(shBody, byte(len(shExts)>>8), byte(len(shExts)))
-	shBody = append(shBody, shExts...)
-	serverHello := handshakeMsg(handshakeTypeServerHello, shBody)
 
 	th := suite.hash()
 	th.Write(ch.RawOriginal)
 
 	c := &tls13Conn{Conn: conn, suite: suite}
-	if err := c.writePlainRecord(recordTypeHandshake, serverHello); err != nil {
-		return nil, err
+	if flight.isMirrored() {
+		if _, err := conn.Write(flight.serverHello); err != nil {
+			return nil, err
+		}
+		th.Write(flight.serverHello[5:])
+		// the reference always emits the middlebox-compatibility CCS
+		if _, err := conn.Write([]byte{recordTypeChangeCipherSpec, 0x03, 0x03, 0x00, 0x01, 0x01}); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := c.writePlainRecord(recordTypeHandshake, flight.serverHello); err != nil {
+			return nil, err
+		}
+		th.Write(flight.serverHello)
 	}
-	th.Write(serverHello)
 
 	early := hkdfExtract(suite.hash, zeros(suite.hash), zeros(suite.hash))
 	derived1 := deriveSecret(suite.hash, early, "derived", suite.hash())
@@ -350,28 +453,35 @@ func serverHandshake(conn net.Conn, ch *ClientHello, certDER []byte, certPriv ed
 		return nil, err
 	}
 
-	var flight []byte
 	ee := buildEncryptedExtensions(ch)
 	th.Write(ee)
-	flight = append(flight, ee...)
-
 	certMsg := buildCertificateMsg(certDER)
 	th.Write(certMsg)
-	flight = append(flight, certMsg...)
-
 	cvInput := append(append([]byte{}, signaturePadding...), serverSignatureContext...)
 	cvInput = append(cvInput, th.Sum(nil)...)
 	cv := handshakeMsg(handshakeTypeCertificateVer, append([]byte{0x08, 0x07, 0x00, 0x40}, ed25519.Sign(certPriv, cvInput)...))
 	th.Write(cv)
-	flight = append(flight, cv...)
-
 	fin := hmac.New(suite.hash, finishedKey(suite.hash, shsSecret))
 	fin.Write(th.Sum(nil))
 	finMsg := handshakeMsg(handshakeTypeFinished, fin.Sum(nil))
 	th.Write(finMsg)
-	flight = append(flight, finMsg...)
+	msgs := [][]byte{ee, certMsg, cv, finMsg}
 
-	if err := c.writeRecord(recordTypeHandshake, flight); err != nil {
+	if flight.isMirrored() {
+		for i, msg := range msgs {
+			if err := c.writeRecordPad(recordTypeHandshake, msg, flight.appLens[i]); err != nil {
+				return nil, err
+			}
+		}
+		if flight.nstLen > 5+c.writeAEAD.Overhead()+2 {
+			// junk plaintext of exactly dest's NewSessionTicket record size
+			plain := make([]byte, flight.nstLen-5-c.writeAEAD.Overhead())
+			copy(plain, []byte{0x17, 0x00})
+			if err := c.writeSealedRecord(plain); err != nil {
+				return nil, err
+			}
+		}
+	} else if err := c.writeRecord(recordTypeHandshake, bytes.Join(msgs, nil)); err != nil {
 		return nil, err
 	}
 
@@ -390,7 +500,23 @@ func serverHandshake(conn net.Conn, ch *ClientHello, certDER []byte, certPriv ed
 	if err := c.setWriteKeys(saps); err != nil {
 		return nil, err
 	}
+	if flight.isMirrored() {
+		for _, total := range flight.postLens {
+			if err := c.writeFakeRecord(total); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return c, nil
+}
+
+func suiteByID(id uint16) (suiteInfo, error) {
+	for _, s := range cipherSuites {
+		if s.id == id {
+			return s, nil
+		}
+	}
+	return suiteInfo{}, fmt.Errorf("unsupported cipher suite 0x%04x", id)
 }
 
 func buildEncryptedExtensions(ch *ClientHello) []byte {
@@ -431,7 +557,7 @@ func (c *tls13Conn) readClientFinished(th hash.Hash, chsSecret []byte) error {
 	expected := hmac.New(c.suite.hash, finishedKey(c.suite.hash, chsSecret))
 	expected.Write(th.Sum(nil))
 	for {
-		typ, raw, err := c.readPhysicalRecord()
+		typ, raw, _, err := c.readPhysicalRecord()
 		if err != nil {
 			return err
 		}
@@ -481,6 +607,16 @@ func (c *tls13Conn) decryptAndUnpad(body []byte, recordType byte) (byte, []byte,
 
 func (c *tls13Conn) Read(p []byte) (int, error) {
 	for len(c.plain) == 0 {
+		if c.rawMode {
+			// raw stream: leftovers first (the failed record, then bytes
+			// over-read into pending), then the socket as-is
+			if len(c.pending) > 0 {
+				c.plain, c.pending = c.pending, nil
+				continue
+			}
+			n, err := c.Conn.Read(p)
+			return n, err
+		}
 		typ, body, err := c.readRecord()
 		if err != nil {
 			return 0, err
@@ -488,6 +624,8 @@ func (c *tls13Conn) Read(p []byte) (int, error) {
 		switch typ {
 		case recordTypeApplicationData:
 			c.plain = body
+		case recordTypeRawStream:
+			// c.plain was filled by readRecord; fall through to the copy
 		case recordTypeHandshake:
 			if err := c.handlePostHandshake(body); err != nil {
 				return 0, err
@@ -534,17 +672,8 @@ func (c *tls13Conn) Write(p []byte) (int, error) {
 // where the write side drops the outer TLS record layer.
 func (c *tls13Conn) Underlying() net.Conn { return c.Conn }
 
-// VisionDirect is the read-side counterpart of Underlying: it returns the
-// raw transport plus every stream byte still buffered inside this conn
-// (decrypted payload first, then bytes read past the current record).
-func (c *tls13Conn) VisionDirect() (net.Conn, []byte) {
-	buffered := append(c.plain, c.pending...)
-	c.plain, c.pending = nil, nil
-	return c.Conn, buffered
-}
-
 func (c *tls13Conn) Close() error {
-	if c.writeAEAD != nil {
+	if c.writeAEAD != nil && !c.rawMode {
 		c.writeRecord(recordTypeAlert, []byte{1, 0}) // close_notify, best effort
 	}
 	return c.Conn.Close()

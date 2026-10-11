@@ -56,8 +56,8 @@ type VisionConn struct {
 	content    int
 	padding    int
 	command    byte
+	inBlock    bool // a frame header has been read and its body is pending
 	scratch    [8192]byte
-	rConn      net.Conn // set after cmdPadDirect: read the raw transport
 
 	// write half
 	wFirst   bool
@@ -84,9 +84,6 @@ func (c *VisionConn) Read(p []byte) (int, error) {
 		if c.out.Len() > 0 {
 			return c.out.Read(p)
 		}
-		if c.rConn != nil {
-			return c.rConn.Read(p)
-		}
 		if c.pendingErr != nil {
 			err := c.pendingErr
 			c.pendingErr = nil
@@ -100,6 +97,9 @@ func (c *VisionConn) Read(p []byte) (int, error) {
 			c.parse(c.scratch[:n])
 		}
 		if err != nil {
+			if visionDebug {
+				log.Printf("vision read: underlying error: %v", err)
+			}
 			c.pendingErr = err
 		}
 	}
@@ -124,6 +124,10 @@ func (c *VisionConn) parse(b []byte) {
 		b = c.pre.Bytes()[16:]
 		c.pre.Reset()
 	}
+	if visionDebug {
+		log.Printf("vision parse: fill=%d state cmdLeft=%d content=%d padding=%d out=%d",
+			len(b), c.cmdLeft, c.content, c.padding, c.out.Len())
+	}
 	i := 0
 	for i < len(b) {
 		if c.cmdLeft > 0 {
@@ -140,9 +144,17 @@ func (c *VisionConn) parse(b []byte) {
 				c.padding = int(ch) << 8
 			case 1:
 				c.padding |= int(ch)
+				if visionDebug {
+					log.Printf("vision read: frame cmd=%d content=%d pad=%d", c.command, c.content, c.padding)
+				}
 			}
 			c.cmdLeft--
-		} else if c.content > 0 {
+			if c.cmdLeft == 0 {
+				c.inBlock = true
+			}
+			continue
+		}
+		if c.content > 0 {
 			n := min(c.content, len(b)-i)
 			c.detMu.Lock()
 			c.det.filter(b[i : i+n])
@@ -154,18 +166,33 @@ func (c *VisionConn) parse(b []byte) {
 			n := min(c.padding, len(b)-i)
 			i += n
 			c.padding -= n
-		} else if c.command == cmdPadContinue {
+		}
+		if c.inBlock && c.cmdLeft == 0 && c.content == 0 && c.padding == 0 {
+			// the frame completed — possibly exactly at this fill's end, so
+			// the transition must happen now, not on the next chunk
+			c.inBlock = false
+			if c.command != cmdPadContinue {
+				c.raw = true
+				c.out.Write(b[i:])
+				if n := c.br.Buffered(); n > 0 {
+					buf := make([]byte, n)
+					if _, err := io.ReadFull(c.br, buf); err == nil {
+						c.out.Write(buf)
+					}
+				}
+				if c.command == cmdPadDirect {
+					// the peer has dropped the outer record layer: whatever
+					// still looks like outer records is raw stream from now on
+					if rf, ok := c.Conn.(interface{ SetRawFallback() }); ok {
+						rf.SetRawFallback()
+					}
+				}
+				if visionDebug {
+					log.Printf("vision read: end cmd=%d, %d raw tail bytes", c.command, len(b)-i)
+				}
+				return
+			}
 			c.cmdLeft = visionHeadLen
-		} else { // cmdPadEnd / cmdPadDirect: padding phase over
-			c.raw = true
-			c.out.Write(b[i:])
-			if c.command == cmdPadDirect {
-				c.switchDirectRead()
-			}
-			if visionDebug {
-				log.Printf("vision read: end cmd=%d, %d raw tail bytes", c.command, len(b)-i)
-			}
-			return
 		}
 	}
 }
@@ -272,31 +299,13 @@ func completeTLSRecords(p []byte) bool {
 	return true
 }
 
-// switchDirectRead implements the vision direct-copy handover: after the
-// padding-direct frame the peer drops the outer TLS layer, so this side
-// reads the raw transport too. Bytes still buffered above it (bufio) and
-// inside it (decrypted record payloads, over-read wire bytes) belong to
-// the stream and are appended in order before the socket takes over.
-func (c *VisionConn) switchDirectRead() {
-	if n := c.br.Buffered(); n > 0 {
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(c.br, buf); err == nil {
-			c.out.Write(buf)
-		}
+// Close sends no outer close_notify once the write side went raw: the peer
+// reads that region as stream bytes, and a sealed alert would corrupt it.
+func (c *VisionConn) Close() error {
+	if c.wConn != nil {
+		return c.wConn.Close()
 	}
-	ds, ok := c.Conn.(interface {
-		Underlying() net.Conn
-		VisionDirect() (net.Conn, []byte)
-	})
-	if !ok {
-		return
-	}
-	raw, buffered := ds.VisionDirect()
-	if visionDebug {
-		log.Printf("vision read: direct copy, %d buffered stream bytes", len(buffered))
-	}
-	c.out.Write(buffered)
-	c.rConn = raw
+	return c.Conn.Close()
 }
 
 // tlsDetector recognizes the inner stream's TLS handshake, replicating

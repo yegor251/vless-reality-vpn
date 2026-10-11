@@ -182,6 +182,36 @@ func TestVisionWriteFrames(t *testing.T) {
 	}
 }
 
+func TestVisionFrameEndAtChunkBoundary(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	var uid UserID
+	uid[7] = 0x33
+
+	// each Write is one Read on net.Pipe, so framing the end frame alone
+	// reproduces a frame ending exactly at a chunk boundary
+	go func() {
+		vc := &visionClient{w: client, uuid: append([]byte(nil), uid[:]...)}
+		vc.frame(cmdPadContinue, []byte("first"), 3)
+		vc.frame(cmdPadEnd, []byte("last"), 0)
+		client.Close() // no trailing bytes: the end must be processed on the spot
+	}()
+
+	v := NewVisionConn(server, bufio.NewReader(server), uid)
+	got, err := io.ReadAll(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "firstlast" {
+		t.Fatalf("read %q", got)
+	}
+	if !v.raw {
+		t.Fatal("padding phase not closed after end frame at chunk boundary")
+	}
+}
+
 func TestTLSDetector(t *testing.T) {
 	var d tlsDetector = tlsDetector{packets: filterPackets}
 	clientHello := make([]byte, 64)

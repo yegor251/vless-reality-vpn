@@ -47,10 +47,12 @@ func Handle(conn net.Conn, cfg *Config) net.Conn {
 	}
 
 	// The dest must answer like a TLS 1.3 server, as in the reference
-	// implementation — it doubles as a liveness check for the camouflage.
-	if !probeDest(cfg, raw) {
+	// implementation — it doubles as a liveness check for the camouflage and
+	// provides the handshake template our flight is mirrored onto.
+	flight := readDestFlight(cfg, raw)
+	if flight == nil {
 		log.Printf("%s: dest oracle failed", conn.RemoteAddr())
-		conn.Close()
+		fallback(conn, cfg, raw)
 		return nil
 	}
 
@@ -59,7 +61,7 @@ func Handle(conn net.Conn, cfg *Config) net.Conn {
 		deadline.SetDeadline(time.Now().Add(handshakeTimeout))
 		defer deadline.SetDeadline(time.Time{})
 	}
-	tlsConn, err := serverHandshake(conn, ch, certDER, certPriv)
+	tlsConn, err := serverHandshake(conn, ch, certDER, certPriv, flight)
 	if err != nil {
 		log.Printf("%s: tls handshake: %v", conn.RemoteAddr(), err)
 		conn.Close()
@@ -94,25 +96,6 @@ func fallback(conn net.Conn, cfg *Config, first []byte) {
 	}()
 	io.Copy(conn, target)
 	<-done
-}
-
-// probeDest forwards the ClientHello to Dest and checks that a TLS 1.3
-// ServerHello comes back.
-func probeDest(cfg *Config, clientHello []byte) bool {
-	target, err := net.DialTimeout("tcp", cfg.Dest, cfg.DialTimeout)
-	if err != nil {
-		return false
-	}
-	defer target.Close()
-	target.SetDeadline(time.Now().Add(cfg.DialTimeout))
-	if _, err := target.Write(clientHello); err != nil {
-		return false
-	}
-	head := make([]byte, 6)
-	if _, err := io.ReadFull(target, head); err != nil {
-		return false
-	}
-	return head[0] == 22 && head[1] == 0x03 && head[2] == 0x03 && head[5] == 2
 }
 
 // NewConfig parses the wire-format fields of the server REALITY settings.
