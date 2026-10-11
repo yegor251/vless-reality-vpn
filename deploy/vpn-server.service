@@ -4,7 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/vpn-server -config /etc/vpn/server.json
+# config is root:600; systemd injects it read-only for the DynamicUser service
+LoadCredential=server.json:/etc/vpn/server.json
+ExecStart=/usr/local/bin/vpn-server -config %d/server.json
 Restart=on-failure
 RestartSec=5
 
